@@ -85,14 +85,12 @@ class NextItNet(nn.Module):
         # self.fc_q = nn.Linear(hidden_size, self.item_num)
 
     def split_heads(self, x, num_heads):
-        """拆分最後一個維度為 (num_heads, depth)，然後轉置維度順序"""
         batch_size, seq_len, d_model = x.size()
         depth = d_model // num_heads
         x = x.view(batch_size, seq_len, num_heads, depth)
         return x.permute(0, 2, 1, 3)  # (batch_size, num_heads, seq_len, depth)
 
     def scaled_dot_product_attention(self, Q, K, V, mask=None):
-        """計算 Scaled Dot-Product Attention"""
         # Q, K, V: (batch_size, num_heads, seq_len, depth)
         dk = Q.size(-1)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / torch.sqrt(torch.tensor(dk, dtype=torch.float32, device=Q.device))
@@ -104,27 +102,21 @@ class NextItNet(nn.Module):
         return output, attn_weights
 
     def multi_head_attention(self, q, k, v, mask=None):
-        """實現 Multi-Head Attention"""
         batch_size, seq_len, d_model = q.size()
         
-        # 線性變換
         Q = torch.matmul(q, self.Wq)  # (batch_size, seq_len, d_model)
         K = torch.matmul(k, self.Wk)
         V = torch.matmul(v, self.Wv)
 
-        # 拆分頭部
         Q = self.split_heads(Q, self.attention_heads)  # (batch_size, num_heads, seq_len, depth)
         K = self.split_heads(K, self.attention_heads)
         V = self.split_heads(V, self.attention_heads)
 
-        # 計算注意力
         attn_output, attn_weights = self.scaled_dot_product_attention(Q, K, V, mask)
 
-        # 合併頭部
         attn_output = attn_output.permute(0, 2, 1, 3).contiguous()  # (batch_size, seq_len, num_heads, depth)
         concat_attn = attn_output.view(batch_size, seq_len, d_model)  # (batch_size, seq_len, d_model)
 
-        # 最終線性變換
         output = torch.matmul(concat_attn, self.Wo)  # (batch_size, seq_len, d_model)
         return output, attn_weights
 
