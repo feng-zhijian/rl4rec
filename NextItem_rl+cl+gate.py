@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import os
+import random
 import argparse
 from utility import pad_history, calculate_hit, double_qlearning_loss
 import pdb
@@ -22,6 +23,8 @@ def parse_args():
     parser.add_argument('--r_follow', type=float, default=3.0,help='reward for the purchase behavior.')
     parser.add_argument('--r_like', type=float, default=3.0,help='reward for the purchase behavior.')
     parser.add_argument('--r_forward', type=float, default=2.0,help='reward for the purchase behavior.')
+
+    parser.add_argument('--neg_len', type=int, default=10,help='contrast learning negative sample length.')    
 
     parser.add_argument('--lr', type=float, default=0.01, help='Learning rate.')
     parser.add_argument('--discount', type=float, default=0.5, help='Discount factor for RL.')
@@ -46,9 +49,8 @@ class NextItNet(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_size//2, self.scenario_num),
         ])
-        
 
-        self.fc_ce = nn.ModuleList([
+        self.fc_nextitem = nn.ModuleList([
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
@@ -56,7 +58,13 @@ class NextItNet(nn.Module):
             nn.Linear(hidden_size, hidden_size),
         ])
 
-    def forward(self, inputs, len_state):
+        # self.fc_q = nn.Linear(hidden_size, self.item_num)
+
+    def forward(self, inputs, len_state, neg_items=None, next_true_item=None, true_scenario=None):
+        # 行为序列：inputs: torch.Size([256, 20])
+        # 状态序列长度：len_state: torch.Size([256])
+        # 负样本: torch.Size([256, 10])
+        # len_state: torch.Size([256])
         mask = (inputs != self.item_num).float().unsqueeze(-1)
         x = self.embedding(inputs) * mask
         for block in self.blocks:
@@ -65,22 +73,36 @@ class NextItNet(nn.Module):
         state_hidden = x.gather(1, idx).squeeze(1)
 
         # all_q_values：输出所有 场景 的 Q-value： torch.Size([256, 2])
-        # 每个 场景（候选场景）对应一个 Q 值，表示在当前状态下选择该 场景 的期望回报
-        # 用在 TRFL double_qlearning 里，参与 Q-learning 损失 (qloss) 的计算。
         x = state_hidden
         for layer in self.fc_q:
             x = layer(x)
         all_q_values = torch.softmax(x, dim=-1)
 
-        # all_ce_logits: 输出所有 item 的 logits（分类预测分数） ： torch.Size([256, 279081])
-        # 用于监督学习的 Cross-Entropy loss，即预测用户下一个真实 item。
-        # 通过 tf.nn.sparse_softmax_cross_entropy_with_logits 来训练。
+        # fc_nextitem: 输出所有 next item 的 embedding ： torch.Size([256, 64])
         x = state_hidden
-        for layer in self.fc_ce:
+        for layer in self.fc_nextitem:
             x = layer(x)
-        all_ce_logits = x
+        pred_next_item_emb = x
 
-        return all_q_values, all_ce_logits
+        if self.training:
+            true_scenario_probability = all_q_values.gather(1, true_scenario.unsqueeze(1)).squeeze(1) # torch.Size([256])
+            gate = 1 / (1 - true_scenario_probability + 1e-8)  # torch.Size([256])
+
+            # === 对比学习 Triplet Loss ===
+            neg_item_embs = self.embedding(neg_items) # torch.Size([256, 10, 64])
+            next_true_item_emb = self.embedding(next_true_item) # torch.Size([256, 64])
+
+            pos_euclid = torch.norm(pred_next_item_emb - next_true_item_emb, dim=1, p=2)  # torch.Size([256])
+            expand_output2 = state_hidden.unsqueeze(1)  # torch.Size([256, 1, 64])
+            neg_euclid = torch.norm(expand_output2 - neg_item_embs, dim=2, p=2)    # torch.Size([256, 10])
+            pos_euclid_exp = pos_euclid.unsqueeze(-1)  # torch.Size([256, 1])
+            cl_loss = pos_euclid_exp - neg_euclid + 70
+            cl_loss = torch.where(cl_loss < 0, torch.zeros_like(cl_loss), cl_loss)  # torch.Size([256, 10])
+            cl_loss = torch.mean(torch.mean(cl_loss, dim=-1) * gate)  # torch.Size([256]) => value
+
+            return all_q_values, cl_loss, pred_next_item_emb
+        else:
+            return all_q_values, pred_next_item_emb
 
 def evaluate(mainQN, device, data_directory, state_size, item_num, reward_click, reward_follow, reward_like, reward_forward, topk, scenario_num, logger=None):
     mainQN.eval()
@@ -163,26 +185,27 @@ def evaluate(mainQN, device, data_directory, state_size, item_num, reward_click,
                 rewards.append(reward)
                 history.append(row['item_id'])
                 types.append(type)
+
             evaluated += 1
             pbar.update(1)
         states_tensor = torch.tensor(states, dtype=torch.long, device=device)
         len_states_tensor = torch.tensor(len_states, dtype=torch.long, device=device)
 
         with torch.no_grad():
-            _, prediction = mainQN(states_tensor, len_states_tensor)
-            prediction = prediction.cpu().numpy() 
+            _, pred_next_item_emb = mainQN(states_tensor, len_states_tensor)
+            pred_next_item_emb = pred_next_item_emb.cpu().numpy() 
 
         topk_max = max(topk)
         # 取每个样本的 topk_max 个最大值的索引（未排序）
-        topk_indices = np.argpartition(prediction, -topk_max, axis=1)[:, -topk_max:]
+        topk_indices = np.argpartition(pred_next_item_emb, -topk_max, axis=1)[:, -topk_max:]
         # 再对 topk 内部排序（从大到小）
-        topk_scores = np.take_along_axis(prediction, topk_indices, axis=1)
+        topk_scores = np.take_along_axis(pred_next_item_emb, topk_indices, axis=1)
         sorted_idx = np.argsort(-topk_scores, axis=1)
         sorted_list = np.take_along_axis(topk_indices, sorted_idx, axis=1)
 
         calculate_hit(sorted_list, topk, true_items, rewards, reward_click, total_reward, hit_clicks, ndcg_clicks, hit_follow, ndcg_follow, hit_forward, ndcg_forward, hit_like, ndcg_like, scenarios_reward_dict, types)
     pbar.close()
-
+        
     msg_lines = []
     msg_lines.append('#############################################################')
     msg_lines.append('total clicks: %d, total follow: %d, total forward: %d, total like: %d' % (total_clicks, total_follow, total_forward, total_like))
@@ -211,6 +234,8 @@ def evaluate(mainQN, device, data_directory, state_size, item_num, reward_click,
     else:
         print(msg)
 
+
+
 if __name__ == '__main__':
     logging.basicConfig(
         level=logging.INFO,
@@ -228,6 +253,8 @@ if __name__ == '__main__':
     state_size = data_statis['state_size'][0]
     item_num = data_statis['item_num'][0]
     scenario_num = data_statis['scenario_num'][0]
+
+    neg_len = args.neg_len
 
     reward_click = args.r_click
     reward_follow = args.r_follow
@@ -249,7 +276,7 @@ if __name__ == '__main__':
     num_rows = replay_buffer.shape[0]
     num_batches = int(num_rows / args.batch_size)
     print("start training")
-    
+
     for epoch in range(args.epoch):
         logger.info(f"Epoch {epoch+1}/{args.epoch}")
         with tqdm(total=num_batches, desc='Training', ncols=80) as pbar:
@@ -257,6 +284,27 @@ if __name__ == '__main__':
                 batch = replay_buffer.sample(n=args.batch_size).to_dict()
                 next_state = torch.tensor(list(batch['next_state'].values()), dtype=torch.long, device=device)
                 len_next_state = torch.tensor(list(batch['len_next_states'].values()), dtype=torch.long, device=device)
+
+
+                state = torch.tensor(list(batch['state'].values()), dtype=torch.long, device=device)
+                len_state = torch.tensor(list(batch['len_state'].values()), dtype=torch.long, device=device)
+                action = torch.tensor(list(batch['action'].values()), dtype=torch.long, device=device) # action 就是 label：0/1 只有两个场景
+                true_scenario = torch.tensor(list(batch['true_scenario'].values()), dtype=torch.long, device=device) # 下一个场景的id 就是 label：0/1 只有两个场景
+
+                next_true_item = list(batch['true_item'].values())
+                negative_item = list()
+
+                for idx,val in enumerate(next_true_item):
+                    temp_neg_list = []
+                    for i in range(neg_len):
+                        neg_item = random.randint(0, item_num)
+                        while neg_item in state[idx]:
+                            neg_item = random.randint(0, item_num)
+                        temp_neg_list.append(neg_item)
+                    negative_item.append(temp_neg_list)
+                negative_item = torch.tensor(negative_item, dtype=torch.long, device=device)
+                next_true_item = torch.tensor(list(batch['true_item'].values()), dtype=torch.long, device=device)
+
                 pointer = np.random.randint(0, 2)
                 if pointer == 0:
                     mainQN, target_QN, optimizer = NextRec1, NextRec2, optimizer1
@@ -266,17 +314,14 @@ if __name__ == '__main__':
                 # 目标网络输出的 Q(s’, a)，用来 评估动作的价值
                 # 主网络输出的 Q(s’, a)，用来 选择动作 (argmax)
                 with torch.no_grad():
-                    target_Qs, _ = target_QN(next_state, len_next_state)
-                    target_Qs_selector, _ = mainQN(next_state, len_next_state)
+                    target_Qs, _, _ = target_QN(next_state, len_next_state, negative_item, next_true_item, true_scenario)
+                    target_Qs_selector, _, _ = mainQN(next_state, len_next_state, negative_item, next_true_item, true_scenario)
 
                 is_done = list(batch['is_done'].values())
                 for index in range(target_Qs.shape[0]):
                     if is_done[index]:
                         target_Qs[index] = torch.zeros(scenario_num, device=target_Qs.device, dtype=target_Qs.dtype)
 
-                state = torch.tensor(list(batch['state'].values()), dtype=torch.long, device=device)
-                len_state = torch.tensor(list(batch['len_state'].values()), dtype=torch.long, device=device)
-                action = torch.tensor(list(batch['action'].values()), dtype=torch.long, device=device) # action 就是 label：0/1 只有两个场景
 
                 is_click = list(batch['is_click'].values())
                 is_like = list(batch['is_like'].values())
@@ -297,11 +342,12 @@ if __name__ == '__main__':
                 reward = torch.tensor(reward, dtype=torch.float, device=device)
                 discount = torch.tensor([args.discount] * len(action), dtype=torch.float, device=device)
 
-                q_values, logits = mainQN(state, len_state)
-                celoss = F.cross_entropy(logits, action)
+                q_values, cl_loss, pred_next_item_emb = mainQN(state, len_state, negative_item, next_true_item, true_scenario)
+                # celoss = F.cross_entropy(logits, action)
                 
                 qloss = double_qlearning_loss(q_values, action, reward, discount, target_Qs, target_Qs_selector)
-                loss = celoss + qloss
+
+                loss = cl_loss + qloss
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()

@@ -4,12 +4,14 @@ import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import os
+import random
 import argparse
-from utility import pad_history, calculate_hit, double_qlearning_loss
+from utility import pad_history, calculate_hit, double_qlearning_loss, insert_flag
 import pdb
 from NextItNetModules_pytorch import NextItNetResidualBlock
 from tqdm import tqdm
 import logging
+import copy
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run supervised NextItNet (PyTorch version).")
@@ -23,6 +25,10 @@ def parse_args():
     parser.add_argument('--r_like', type=float, default=3.0,help='reward for the purchase behavior.')
     parser.add_argument('--r_forward', type=float, default=2.0,help='reward for the purchase behavior.')
 
+
+    parser.add_argument('--neg_len', type=int, default=10,help='contrast learning negative sample length.')    
+    parser.add_argument('--seq_max_len', type=int, default=20,help='sequence length.')    
+
     parser.add_argument('--lr', type=float, default=0.01, help='Learning rate.')
     parser.add_argument('--discount', type=float, default=0.5, help='Discount factor for RL.')
     return parser.parse_args()
@@ -34,7 +40,8 @@ class NextItNet(nn.Module):
         self.hidden_size = hidden_size
         self.item_num = int(item_num)
         self.scenario_num = scenario_num
-        self.embedding = nn.Embedding(self.item_num + 1, hidden_size, padding_idx=self.item_num)
+        self.embedding = nn.Embedding(self.item_num + 2, hidden_size, padding_idx=self.item_num)
+        self.scenario_embedding = nn.Embedding(self.scenario_num + 1, hidden_size, padding_idx=self.scenario_num)
         self.dilations = dilations if dilations is not None else [1, 2, 1, 2, 1, 2]
         self.blocks = nn.ModuleList([
             NextItNetResidualBlock(hidden_size, kernel_size, dilation, causal=True)
@@ -46,9 +53,8 @@ class NextItNet(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_size//2, self.scenario_num),
         ])
-        
 
-        self.fc_ce = nn.ModuleList([
+        self.fc_nextitem = nn.ModuleList([
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size),
@@ -56,31 +62,125 @@ class NextItNet(nn.Module):
             nn.Linear(hidden_size, hidden_size),
         ])
 
-    def forward(self, inputs, len_state):
+        # Multi-Head Attention 權重參數
+        self.attention_heads = 4
+        self.attention_d_model = hidden_size
+        self.attention_depth = hidden_size // self.attention_heads
+        
+        # 確保 hidden_size 能被 attention_heads 整除
+        assert hidden_size % self.attention_heads == 0, f"hidden_size {hidden_size} must be divisible by attention_heads {self.attention_heads}"
+        
+        # 創建可學習的權重參數
+        self.Wq = nn.Parameter(torch.empty(hidden_size, hidden_size))
+        self.Wk = nn.Parameter(torch.empty(hidden_size, hidden_size))
+        self.Wv = nn.Parameter(torch.empty(hidden_size, hidden_size))
+        self.Wo = nn.Parameter(torch.empty(hidden_size, hidden_size))
+        
+        # 初始化權重
+        nn.init.trunc_normal_(self.Wq, std=0.02, a=-2*0.02, b=2*0.02)
+        nn.init.trunc_normal_(self.Wk, std=0.02, a=-2*0.02, b=2*0.02)
+        nn.init.trunc_normal_(self.Wv, std=0.02, a=-2*0.02, b=2*0.02)
+        nn.init.trunc_normal_(self.Wo, std=0.02, a=-2*0.02, b=2*0.02)
+
+        # self.fc_q = nn.Linear(hidden_size, self.item_num)
+
+    def split_heads(self, x, num_heads):
+        """拆分最後一個維度為 (num_heads, depth)，然後轉置維度順序"""
+        batch_size, seq_len, d_model = x.size()
+        depth = d_model // num_heads
+        x = x.view(batch_size, seq_len, num_heads, depth)
+        return x.permute(0, 2, 1, 3)  # (batch_size, num_heads, seq_len, depth)
+
+    def scaled_dot_product_attention(self, Q, K, V, mask=None):
+        """計算 Scaled Dot-Product Attention"""
+        # Q, K, V: (batch_size, num_heads, seq_len, depth)
+        dk = Q.size(-1)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / torch.sqrt(torch.tensor(dk, dtype=torch.float32, device=Q.device))
+        if mask is not None:
+            # mask: (batch_size, 1, seq_len, seq_len) or broadcastable
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+        attn_weights = torch.softmax(scores, dim=-1)
+        output = torch.matmul(attn_weights, V)
+        return output, attn_weights
+
+    def multi_head_attention(self, q, k, v, mask=None):
+        """實現 Multi-Head Attention"""
+        batch_size, seq_len, d_model = q.size()
+        
+        # 線性變換
+        Q = torch.matmul(q, self.Wq)  # (batch_size, seq_len, d_model)
+        K = torch.matmul(k, self.Wk)
+        V = torch.matmul(v, self.Wv)
+
+        # 拆分頭部
+        Q = self.split_heads(Q, self.attention_heads)  # (batch_size, num_heads, seq_len, depth)
+        K = self.split_heads(K, self.attention_heads)
+        V = self.split_heads(V, self.attention_heads)
+
+        # 計算注意力
+        attn_output, attn_weights = self.scaled_dot_product_attention(Q, K, V, mask)
+
+        # 合併頭部
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous()  # (batch_size, seq_len, num_heads, depth)
+        concat_attn = attn_output.view(batch_size, seq_len, d_model)  # (batch_size, seq_len, d_model)
+
+        # 最終線性變換
+        output = torch.matmul(concat_attn, self.Wo)  # (batch_size, seq_len, d_model)
+        return output, attn_weights
+
+    def forward(self, inputs, len_state, neg_items=None, next_true_item=None, true_scenario=None, attention_next_state=None, attention_scenario_list=None, mask_array=None):
+        # 行为序列：inputs: torch.Size([256, 20])
+        # 状态序列长度：len_state: torch.Size([256])
+        # 负样本: torch.Size([256, 10])
         mask = (inputs != self.item_num).float().unsqueeze(-1)
         x = self.embedding(inputs) * mask
         for block in self.blocks:
             x = block(x) * mask
+        
         idx = (len_state - 1).unsqueeze(1).unsqueeze(2).expand(-1, 1, self.hidden_size)
         state_hidden = x.gather(1, idx).squeeze(1)
 
         # all_q_values：输出所有 场景 的 Q-value： torch.Size([256, 2])
-        # 每个 场景（候选场景）对应一个 Q 值，表示在当前状态下选择该 场景 的期望回报
-        # 用在 TRFL double_qlearning 里，参与 Q-learning 损失 (qloss) 的计算。
         x = state_hidden
         for layer in self.fc_q:
             x = layer(x)
         all_q_values = torch.softmax(x, dim=-1)
 
-        # all_ce_logits: 输出所有 item 的 logits（分类预测分数） ： torch.Size([256, 279081])
-        # 用于监督学习的 Cross-Entropy loss，即预测用户下一个真实 item。
-        # 通过 tf.nn.sparse_softmax_cross_entropy_with_logits 来训练。
+        # fc_nextitem: 输出所有 next item 的 embedding ： torch.Size([256, 64])
         x = state_hidden
-        for layer in self.fc_ce:
+        for layer in self.fc_nextitem:
             x = layer(x)
-        all_ce_logits = x
+        pred_next_item_emb = x
 
-        return all_q_values, all_ce_logits
+
+        if self.training:            
+            # === Multi-Head Attention ===
+            attention_embedding = self.embedding(attention_next_state)  # [batch, seq_len, hidden_size]
+            attention_scenario_embedding = self.scenario_embedding(attention_scenario_list) # [batch, scenario_num, hidden_size]
+            attention_embedding = attention_embedding + attention_scenario_embedding
+            mask_array = mask_array.unsqueeze(1) # [batch, 1, seq_len+1, seq_len+1]
+            attention_ret, attention_weights = self.multi_head_attention(attention_embedding, attention_embedding, attention_embedding, mask_array)
+
+
+            # === Gate ===
+            true_scenario_probability = all_q_values.gather(1, true_scenario.unsqueeze(1)).squeeze(1) # torch.Size([256])
+            gate = 1 / (1 - true_scenario_probability + 1e-8)  # torch.Size([256])
+
+            # === 对比学习 Triplet Loss ===
+            neg_item_embs = self.embedding(neg_items) # torch.Size([256, 10, 64])
+            next_true_item_emb = self.embedding(next_true_item) # torch.Size([256, 64])
+
+            pos_euclid = torch.norm(pred_next_item_emb - next_true_item_emb, dim=1, p=2)  # torch.Size([256])
+            expand_output2 = state_hidden.unsqueeze(1)  # torch.Size([256, 1, 64])
+            neg_euclid = torch.norm(expand_output2 - neg_item_embs, dim=2, p=2)    # torch.Size([256, 10])
+            pos_euclid_exp = pos_euclid.unsqueeze(-1)  # torch.Size([256, 1])
+            cl_loss = pos_euclid_exp - neg_euclid + 70
+            cl_loss = torch.where(cl_loss < 0, torch.zeros_like(cl_loss), cl_loss)  # torch.Size([256, 10])
+            cl_loss = torch.mean(torch.mean(cl_loss, dim=-1) * gate)  # torch.Size([256]) => value
+            
+            return all_q_values, cl_loss, pred_next_item_emb
+        else:
+            return all_q_values, pred_next_item_emb
 
 def evaluate(mainQN, device, data_directory, state_size, item_num, reward_click, reward_follow, reward_like, reward_forward, topk, scenario_num, logger=None):
     mainQN.eval()
@@ -163,26 +263,27 @@ def evaluate(mainQN, device, data_directory, state_size, item_num, reward_click,
                 rewards.append(reward)
                 history.append(row['item_id'])
                 types.append(type)
+
             evaluated += 1
             pbar.update(1)
         states_tensor = torch.tensor(states, dtype=torch.long, device=device)
         len_states_tensor = torch.tensor(len_states, dtype=torch.long, device=device)
 
         with torch.no_grad():
-            _, prediction = mainQN(states_tensor, len_states_tensor)
-            prediction = prediction.cpu().numpy() 
+            _, pred_next_item_emb = mainQN(states_tensor, len_states_tensor)
+            pred_next_item_emb = pred_next_item_emb.cpu().numpy() 
 
         topk_max = max(topk)
         # 取每个样本的 topk_max 个最大值的索引（未排序）
-        topk_indices = np.argpartition(prediction, -topk_max, axis=1)[:, -topk_max:]
+        topk_indices = np.argpartition(pred_next_item_emb, -topk_max, axis=1)[:, -topk_max:]
         # 再对 topk 内部排序（从大到小）
-        topk_scores = np.take_along_axis(prediction, topk_indices, axis=1)
+        topk_scores = np.take_along_axis(pred_next_item_emb, topk_indices, axis=1)
         sorted_idx = np.argsort(-topk_scores, axis=1)
         sorted_list = np.take_along_axis(topk_indices, sorted_idx, axis=1)
 
         calculate_hit(sorted_list, topk, true_items, rewards, reward_click, total_reward, hit_clicks, ndcg_clicks, hit_follow, ndcg_follow, hit_forward, ndcg_forward, hit_like, ndcg_like, scenarios_reward_dict, types)
     pbar.close()
-
+        
     msg_lines = []
     msg_lines.append('#############################################################')
     msg_lines.append('total clicks: %d, total follow: %d, total forward: %d, total like: %d' % (total_clicks, total_follow, total_forward, total_like))
@@ -211,6 +312,8 @@ def evaluate(mainQN, device, data_directory, state_size, item_num, reward_click,
     else:
         print(msg)
 
+
+
 if __name__ == '__main__':
     logging.basicConfig(
         level=logging.INFO,
@@ -228,6 +331,10 @@ if __name__ == '__main__':
     state_size = data_statis['state_size'][0]
     item_num = data_statis['item_num'][0]
     scenario_num = data_statis['scenario_num'][0]
+    
+
+    neg_len = args.neg_len
+    seq_max_len = args.seq_max_len
 
     reward_click = args.r_click
     reward_follow = args.r_follow
@@ -249,14 +356,55 @@ if __name__ == '__main__':
     num_rows = replay_buffer.shape[0]
     num_batches = int(num_rows / args.batch_size)
     print("start training")
-    
+
     for epoch in range(args.epoch):
         logger.info(f"Epoch {epoch+1}/{args.epoch}")
         with tqdm(total=num_batches, desc='Training', ncols=80) as pbar:
             for j in range(num_batches):
+                
                 batch = replay_buffer.sample(n=args.batch_size).to_dict()
                 next_state = torch.tensor(list(batch['next_state'].values()), dtype=torch.long, device=device)
                 len_next_state = torch.tensor(list(batch['len_next_states'].values()), dtype=torch.long, device=device)
+
+                state = torch.tensor(list(batch['state'].values()), dtype=torch.long, device=device)
+                len_state = torch.tensor(list(batch['len_state'].values()), dtype=torch.long, device=device)
+                action = torch.tensor(list(batch['action'].values()), dtype=torch.long, device=device) # action 就是 label：0/1 只有两个场景
+                true_scenario = torch.tensor(list(batch['true_scenario'].values()), dtype=torch.long, device=device) # 下一个场景的id 就是 label：0/1 只有两个场景
+                
+                next_true_item = list(batch['true_item'].values())
+                negative_item = list()
+                for idx,val in enumerate(next_true_item):
+                    temp_neg_list = []
+                    for i in range(neg_len):
+                        neg_item = random.randint(0, item_num)
+                        while neg_item in state[idx]:
+                            neg_item = random.randint(0, item_num)
+                        temp_neg_list.append(neg_item)
+                    negative_item.append(temp_neg_list)
+                negative_item = torch.tensor(negative_item, dtype=torch.long, device=device)
+                next_true_item = torch.tensor(list(batch['true_item'].values()), dtype=torch.long, device=device)
+                
+                mask_array = list()
+                for tmp_len in list(batch['len_next_states'].values()):
+                    mask = np.zeros((seq_max_len+1, seq_max_len+1))
+                    for t_l in range(tmp_len+1):
+                        mask[t_l,:t_l+1] = 1
+                    mask_array.append(mask.astype(bool))
+                mask_array = np.array(mask_array)
+                mask_array = torch.tensor(mask_array, dtype=torch.bool, device=device)
+
+                attention_next_state = [item.copy() for item in batch['next_state'].values()] # 256 * 20
+                # pdb.set_trace()
+                for idx in range(len(attention_next_state)):
+                    attention_next_state[idx] = insert_flag(attention_next_state[idx], item_num, True)
+                # pdb.set_trace()
+                attention_next_state = torch.tensor(attention_next_state, dtype=torch.long, device=device)
+
+                attention_scenario_list = [item.copy() for item in batch['next_scenario'].values()] # 256 * 20
+                for idx in range(len(attention_scenario_list)):
+                    attention_scenario_list[idx] = insert_flag(attention_scenario_list[idx], scenario_num, False)
+                attention_scenario_list = torch.tensor(attention_scenario_list, dtype=torch.long, device=device)
+
                 pointer = np.random.randint(0, 2)
                 if pointer == 0:
                     mainQN, target_QN, optimizer = NextRec1, NextRec2, optimizer1
@@ -266,17 +414,15 @@ if __name__ == '__main__':
                 # 目标网络输出的 Q(s’, a)，用来 评估动作的价值
                 # 主网络输出的 Q(s’, a)，用来 选择动作 (argmax)
                 with torch.no_grad():
-                    target_Qs, _ = target_QN(next_state, len_next_state)
-                    target_Qs_selector, _ = mainQN(next_state, len_next_state)
+                    # pdb.set_trace()
+                    target_Qs, _, _ = target_QN(next_state, len_next_state, negative_item, next_true_item, true_scenario, attention_next_state, attention_scenario_list, mask_array)
+                    target_Qs_selector, _, _ = mainQN(next_state, len_next_state, negative_item, next_true_item, true_scenario, attention_next_state, attention_scenario_list, mask_array)
 
                 is_done = list(batch['is_done'].values())
                 for index in range(target_Qs.shape[0]):
                     if is_done[index]:
                         target_Qs[index] = torch.zeros(scenario_num, device=target_Qs.device, dtype=target_Qs.dtype)
 
-                state = torch.tensor(list(batch['state'].values()), dtype=torch.long, device=device)
-                len_state = torch.tensor(list(batch['len_state'].values()), dtype=torch.long, device=device)
-                action = torch.tensor(list(batch['action'].values()), dtype=torch.long, device=device) # action 就是 label：0/1 只有两个场景
 
                 is_click = list(batch['is_click'].values())
                 is_like = list(batch['is_like'].values())
@@ -297,11 +443,12 @@ if __name__ == '__main__':
                 reward = torch.tensor(reward, dtype=torch.float, device=device)
                 discount = torch.tensor([args.discount] * len(action), dtype=torch.float, device=device)
 
-                q_values, logits = mainQN(state, len_state)
-                celoss = F.cross_entropy(logits, action)
+                q_values, cl_loss, pred_next_item_emb = mainQN(state, len_state, negative_item, next_true_item, true_scenario, attention_next_state, attention_scenario_list, mask_array)
+                # celoss = F.cross_entropy(logits, action)
                 
                 qloss = double_qlearning_loss(q_values, action, reward, discount, target_Qs, target_Qs_selector)
-                loss = celoss + qloss
+
+                loss = cl_loss + qloss
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()

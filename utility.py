@@ -1,3 +1,7 @@
+# ===== PyTorch版 Multi-Head Attention 工具函数 =====
+import math
+import torch.nn.init as init
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -62,4 +66,25 @@ def double_qlearning_loss(q_values, actions, rewards, discounts, target_qs, targ
     td_target = rewards + discounts * next_q
     q_pred = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
     loss = F.mse_loss(q_pred, td_target.detach())
+    # loss = F.mse_loss(q_pred, td_target.detach(), reduction='none')
+    
     return loss
+
+
+def insert_flag(a, item_num, plus):
+    # 支持输入为 list 或 1D torch.Tensor
+    # if isinstance(a, torch.Tensor):
+        # a = a.tolist()
+    index = next((i for i, x in enumerate(a) if x == item_num), None)
+    if plus:
+        if index is not None:
+            a.insert(index, item_num+1)
+        else:
+            a.append(item_num+1)
+    else:
+        if index is not None:
+            a.insert(index, item_num)
+        else:
+            a.append(item_num)
+    a = [int(x) for x in a]
+    return a
