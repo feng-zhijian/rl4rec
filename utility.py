@@ -24,6 +24,40 @@ def pad_history(itemlist,length,pad_item):
         return itemlist
 
 def calculate_hit(sorted_list, topk, actions, rewards, reward_click, total_reward, hit_click, ndcg_click, hit_follow, ndcg_follow, hit_forward, ndcg_forward, hit_like, ndcg_like, scenarios_reward_dict, types):
+    
+    for i in range(len(topk)):
+        rec_list = sorted_list[:, -topk[i]:]
+        for j in range(len(actions)):
+            if actions[j] in rec_list[j]:
+
+                # _idx_arr = np.argwhere(rec_list[j] == actions[j])
+                # _pos = int(_idx_arr[0][0]) if _idx_arr.size > 0 else 0
+                # rank = int(topk[i] - _pos)
+
+                _idx_arr = np.argwhere(rec_list[j] == actions[j])
+                pos = int(_idx_arr[0][0]) if _idx_arr.size > 0 else 0
+                rank = pos + 1   # rank=1 表示最左边，最高分
+
+                total_reward[i] += rewards[j]
+                # 统计不同类型
+                if "c" in types[j]:
+                    hit_click[i] += 1.0
+                    ndcg_click[i] += float(1.0 / np.log2(rank + 1))
+                if "f" in types[j]:
+                    hit_follow[i] += 1.0
+                    ndcg_follow[i] += float(1.0 / np.log2(rank + 1))
+                if "s" in types[j]:
+                    hit_forward[i] += 1.0
+                    ndcg_forward[i] += float(1.0 / np.log2(rank + 1))
+                if "l" in types[j]:
+                    hit_like[i] += 1.0
+                    ndcg_like[i] += float(1.0 / np.log2(rank + 1))
+                # 场景统计
+                if actions[j] in scenarios_reward_dict:
+                    scenarios_reward_dict[actions[j]][i] += rewards[j]
+
+
+def calculate_hit_old(sorted_list, topk, actions, rewards, reward_click, total_reward, hit_click, ndcg_click, hit_follow, ndcg_follow, hit_forward, ndcg_forward, hit_like, ndcg_like, scenarios_reward_dict, types):
     for i in range(len(topk)):
         rec_list = sorted_list[:, -topk[i]:]
         for j in range(len(actions)):
